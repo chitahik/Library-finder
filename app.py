@@ -618,7 +618,7 @@ def main():
     sample = "우리 가족의 보물을 찾아라!\n목화씨\n도슨트 이창용의 미술대모험 2"
     txt = st.text_area("책 제목", height=210, placeholder=sample, help="한 줄에 한 권씩 입력하세요.")
 
-    if not st.button("🔎 한꺼번에 검색", type="primary", use_container_width=True):
+    if not st.button("🔎 한꺼번에 검색", type="primary", width="stretch"):
         return
 
     titles = []
