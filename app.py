@@ -3,12 +3,13 @@ import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 DATA4LIBRARY = "https://data4library.kr/api"
 
@@ -369,208 +370,222 @@ def data4library_result(lib, title):
 
 
 
+def _find_and_check_library(page, library_name):
+    # 1) label 텍스트로 체크박스 클릭
+    labels = page.locator("label")
+    for i in range(labels.count()):
+        lab = labels.nth(i)
+        try:
+            txt = lab.inner_text().strip()
+        except Exception:
+            continue
+        if library_name.replace(" ", "") in txt.replace(" ", ""):
+            try:
+                lab.click()
+                return True
+            except Exception:
+                pass
+
+    # 2) 주변 텍스트를 가진 checkbox 찾기
+    boxes = page.locator('input[type="checkbox"]')
+    for i in range(boxes.count()):
+        box = boxes.nth(i)
+        try:
+            parent_txt = box.locator("xpath=..").inner_text().strip()
+        except Exception:
+            parent_txt = ""
+        if library_name.replace(" ", "") in parent_txt.replace(" ", ""):
+            try:
+                if not box.is_checked():
+                    box.check(force=True)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def _find_search_input(page):
+    # 검색어처럼 보이는 visible input을 우선
+    selectors = [
+        'input[name*="query" i]',
+        'input[name*="search" i]',
+        'input[name*="keyword" i]',
+        'input[name*="word" i]',
+        'input[type="search"]',
+        'input[type="text"]',
+    ]
+    for sel in selectors:
+        loc = page.locator(sel)
+        for i in range(loc.count()):
+            x = loc.nth(i)
+            try:
+                if x.is_visible() and x.is_enabled():
+                    return x
+            except Exception:
+                continue
+    return None
+
 
 @st.cache_data(ttl=90, show_spinner=False)
-def _jongno_submit_search(title):
+def _jongno_browser_search(title):
     """
-    종로구립도서관 검색 폼의 input 이름/checkbox value를 하드코딩하지 않고
-    페이지 자체에서 찾아 제출한다. 사이트가 GET/POST 어느 방식이든 form method를 따른다.
+    실제 Chromium을 띄워 종로구립도서관 검색 페이지에서 사람이 하듯 검색한다.
+    Streamlit 서버에서는 headless 모드로 동작한다.
     """
-    session = requests.Session()
-    search_url = "https://lib.jongno.go.kr/plus_m/search_list_klas.php"
-    r = session.get(search_url, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    url = "https://lib.jongno.go.kr/plus_m/search_list_klas.php"
 
-    forms = soup.find_all("form")
-    chosen = None
-    for form in forms:
-        txt = form.get_text(" ", strip=True)
-        action = form.get("action", "")
-        if "검색" in txt or "search" in action.lower() or "search_list_klas" in action:
-            # 텍스트 입력창이 있는 폼 우선
-            if form.find("input", {"type": ["text", "search"]}) or form.find("input", attrs={"name": re.compile("query|keyword|search", re.I)}):
-                chosen = form
+    with sync_playwright() as pw:
+        # Streamlit Community Cloud의 packages.txt로 설치한 시스템 Chromium 사용.
+        launch_kwargs = dict(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+            ],
+        )
+        # Debian Chromium 경로 후보
+        chromium_paths = ["/usr/bin/chromium", "/usr/bin/chromium-browser"]
+        executable = next((p for p in chromium_paths if os.path.exists(p)), None)
+        if executable:
+            launch_kwargs["executable_path"] = executable
+
+        browser = pw.chromium.launch(**launch_kwargs)
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 1400},
+            locale="ko-KR",
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+
+        # 두 도서관 선택. 이미 체크돼 있으면 건드리지 않아도 됨.
+        _find_and_check_library(page, "청운문학도서관")
+        # 표기는 페이지에 따라 공백 유무가 다름.
+        if not _find_and_check_library(page, "청운효자동 북카페"):
+            _find_and_check_library(page, "청운 효자동 북카페")
+
+        inp = _find_search_input(page)
+        if inp is None:
+            raise RuntimeError("종로구 검색 입력창을 찾지 못했습니다.")
+        inp.fill(title)
+
+        # 검색 버튼: visible '검색' 버튼/링크 중 입력창과 가까운 것을 클릭
+        clicked = False
+        for role in ["button", "link"]:
+            loc = page.get_by_role(role, name=re.compile(r"^\s*검색\s*$"))
+            for i in range(loc.count()):
+                x = loc.nth(i)
+                try:
+                    if x.is_visible():
+                        x.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if clicked:
                 break
 
-    if chosen is None:
-        raise RuntimeError("종로구 검색 폼을 찾지 못했습니다.")
+        if not clicked:
+            # submit input fallback
+            submits = page.locator('input[type="submit"], button[type="submit"]')
+            for i in range(submits.count()):
+                x = submits.nth(i)
+                try:
+                    val = (x.get_attribute("value") or "") + " " + x.inner_text()
+                    if "검색" in val and x.is_visible():
+                        x.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
 
-    data = {}
+        if not clicked:
+            # Enter fallback
+            inp.press("Enter")
 
-    # hidden/default 값 보존
-    for inp in chosen.find_all("input"):
-        name = inp.get("name")
-        if not name:
-            continue
-        typ = (inp.get("type") or "text").lower()
-        if typ in {"hidden"}:
-            data[name] = inp.get("value", "")
+        try:
+            page.wait_for_load_state("networkidle", timeout=12000)
+        except Exception:
+            page.wait_for_timeout(2500)
 
-    # 검색어 입력 필드 자동 탐지
-    search_input = None
-    candidates = chosen.find_all("input")
-    for inp in candidates:
-        name = inp.get("name", "")
-        typ = (inp.get("type") or "text").lower()
-        if typ in {"text", "search"} and re.search(r"query|keyword|search|word|text|key", name, re.I):
-            search_input = inp
-            break
-    if search_input is None:
-        for inp in candidates:
-            typ = (inp.get("type") or "text").lower()
-            if typ in {"text", "search"}:
-                search_input = inp
-                break
-    if search_input is None or not search_input.get("name"):
-        raise RuntimeError("종로구 검색어 입력 필드를 찾지 못했습니다.")
-    data[search_input["name"]] = title
+        body = page.locator("body").inner_text(timeout=10000)
+        result_url = page.url
+        browser.close()
+        return body, result_url
 
-    # 두 도서관 checkbox/select 값을 페이지에서 이름으로 찾아낸다.
-    target_names = ["청운문학도서관", "청운효자동 북카페", "청운 효자동 북카페"]
-    selected = 0
 
-    for inp in chosen.find_all("input", {"type": "checkbox"}):
-        name = inp.get("name")
-        if not name:
-            continue
-        # checkbox 주변 텍스트 확인
-        label_text = ""
-        iid = inp.get("id")
-        if iid:
-            lab = chosen.find("label", attrs={"for": iid})
-            if lab:
-                label_text += " " + lab.get_text(" ", strip=True)
-        parent = inp.parent
-        if parent:
-            label_text += " " + parent.get_text(" ", strip=True)
+def _jongno_library_status(body, title, library_key):
+    """
+    종로구 검색 결과의 실제 화면 텍스트에서 도서관별 자료를 판정.
+    화면 예시: [청운문학도서관] 목화씨 대출가능(비치중)
+    """
+    text = re.sub(r"\s+", " ", body)
+    title_n = norm(title)
+    title_short = title_n[:max(3, int(len(title_n) * 0.65))]
 
-        if any(t in label_text for t in target_names):
-            val = inp.get("value", "on")
-            # 같은 name의 복수 checkbox 처리
-            if name in data:
-                if not isinstance(data[name], list):
-                    data[name] = [data[name]]
-                data[name].append(val)
-            else:
-                data[name] = [val]
-            selected += 1
-
-    # select 기반 도서관 필터가 있으면 해당 option도 선택
-    for sel in chosen.find_all("select"):
-        name = sel.get("name")
-        if not name:
-            continue
-        vals = []
-        for opt in sel.find_all("option"):
-            txt = opt.get_text(" ", strip=True)
-            if any(t in txt for t in target_names):
-                vals.append(opt.get("value", txt))
-        if vals:
-            data[name] = vals if len(vals) > 1 else vals[0]
-            selected += len(vals)
-
-    action = urljoin(r.url, chosen.get("action") or r.url)
-    method = (chosen.get("method") or "get").lower()
-
-    if method == "post":
-        rr = session.post(action, data=data, headers=HEADERS, timeout=20)
+    if library_key == "cheongun":
+        lib_patterns = [r"\[?\s*청운문학도서관\s*\]?"]
     else:
-        rr = session.get(action, params=data, headers=HEADERS, timeout=20)
-    rr.raise_for_status()
-    return rr.text, rr.url, selected
+        lib_patterns = [
+            r"\[?\s*청운효자동\s*북카페\s*\]?",
+            r"\[?\s*청운\s*효자동\s*북카페\s*\]?",
+        ]
 
+    # 도서관명이 나오는 주변 700자를 개별 결과 후보로 본다.
+    snippets = []
+    for pat in lib_patterns:
+        for m in re.finditer(pat, text):
+            s = max(0, m.start() - 250)
+            e = min(len(text), m.end() + 450)
+            snip = text[s:e]
+            sn = norm(snip)
+            if title_n in sn or title_short in sn:
+                snippets.append(snip)
 
-def _jongno_cards(html):
-    soup = BeautifulSoup(html, "html.parser")
+    # 중복 카드 제거
+    unique = []
+    fingerprints = set()
+    for snip in snippets:
+        fp = norm(snip)
+        if fp not in fingerprints:
+            fingerprints.add(fp)
+            unique.append(snip)
 
-    # 레코드 후보: '도서관 :' 또는 [도서관명]을 포함하는 블록
-    candidates = []
-    for tag in soup.find_all(["li", "div", "article", "tr"]):
-        txt = tag.get_text(" ", strip=True)
-        if not txt:
-            continue
-        if ("도서관" in txt and ("대출가능" in txt or "대출불가" in txt or "비치중" in txt)) or \
-           ("청운문학도서관" in txt and "저자" in txt) or ("청운효자동" in txt and "저자" in txt):
-            if 20 <= len(txt) <= 1800:
-                candidates.append(txt)
+    if not unique:
+        return "⚪ 소장 없음", 0, 0
 
-    # 중첩 div 중복 제거: 가장 짧은 고유 텍스트를 선호
-    uniq = []
-    for txt in sorted(set(candidates), key=len):
-        if not any(txt in u or u in txt for u in uniq):
-            uniq.append(txt)
-    return uniq
+    available = any(
+        ("대출가능" in s or "비치중" in s) and "대출불가" not in s
+        for s in unique
+    )
+
+    # 결과 카드가 중복 렌더링될 가능성이 있어 복본 수는 안전하게 '1+'로만 표시.
+    # 종로구 화면에서 검색건수/카드 개수를 안정적으로 읽을 수 있을 때 추후 정확한 숫자로 확장 가능.
+    if available:
+        return "🟢 소장 있음 / 즉시대출 가능", 1, 1
+    return "🟡 소장 있음 / 즉시대출 없음", 0, 1
 
 
 def jongno_result(lib, title):
     try:
-        html, result_url, selected = _jongno_submit_search(title)
-    except Exception:
+        body, result_url = _jongno_browser_search(title)
+        status, available, copies = _jongno_library_status(body, title, lib["key"])
         return {
-            "status": "🔵 공식 검색에서 확인",
+            "status": status,
+            "available": available,
+            "copies": copies,
+            "url": result_url,
+            "source": "종로구립도서관 공식검색(브라우저 자동화)",
+        }
+    except Exception as e:
+        return {
+            "status": "🔵 자동조회 실패 · 공식 검색에서 확인",
             "available": 0,
             "copies": None,
             "url": official_url(lib, title),
-            "source": "종로구립도서관 공식검색",
+            "source": f"종로구립도서관 공식검색(브라우저 자동화): {type(e).__name__}",
         }
-
-    cards = _jongno_cards(html)
-    target = norm(title)
-    short = target[:max(4, int(len(target) * 0.65))]
-
-    if lib["key"] == "cheongun":
-        lib_tokens = ["청운문학도서관"]
-    else:
-        lib_tokens = ["청운효자동북카페", "청운효자동 북카페", "청운 효자동 북카페"]
-
-    matches = []
-    for c in cards:
-        nc = norm(c)
-        if not any(norm(x) in nc for x in lib_tokens):
-            continue
-        if target not in nc and short not in nc:
-            continue
-        matches.append(c)
-
-    # 같은 책 카드가 상위 div/하위 div로 중복 검출될 수 있어 핵심 문자열 기준 dedupe
-    dedup = []
-    seen = set()
-    for c in matches:
-        # 저자~청구기호 정도를 fingerprint로
-        fp = norm(c)
-        if fp in seen:
-            continue
-        seen.add(fp)
-        dedup.append(c)
-    matches = dedup
-
-    if not matches:
-        return {
-            "status": "⚪ 소장 없음",
-            "available": 0,
-            "copies": 0,
-            "url": result_url,
-            "source": "종로구립도서관 공식검색",
-        }
-
-    has_available = any(("대출가능" in c or "비치중" in c) and "대출불가" not in c for c in matches)
-    copies = len(matches)
-
-    if has_available:
-        status = f"🟢 소장 {copies} / 즉시대출 가능"
-        avail = 1
-    else:
-        status = f"🟡 소장 {copies} / 즉시대출 없음"
-        avail = 0
-
-    return {
-        "status": status,
-        "available": avail,
-        "copies": copies,
-        "url": result_url,
-        "source": "종로구립도서관 공식검색",
-    }
 
 
 def official_url(lib, title):
@@ -651,7 +666,7 @@ def main():
                 url = detail[title][lib["key"]]["url"]
                 st.markdown(f'[{lib["label"]} 공식 확인]({url})')
 
-    st.caption("※ 네 곳 모두 각 도서관 공식 검색 결과를 기준으로 자동 조회합니다.")
+    st.caption("※ 책 제목 한 번으로 네 도서관을 함께 조회합니다. 청운 두 곳은 실제 브라우저를 자동으로 조작해 종로구 공식 검색 결과를 읽습니다.")
 
 
 if __name__ == "__main__":
