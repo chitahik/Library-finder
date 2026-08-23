@@ -105,7 +105,7 @@ def build_library_summary(titles, detail):
 
         summaries.append({
             "key": key,
-            "name": lib["name"],
+            "name": lib["label"],
             "available_titles": available_titles,
             "available_count": len(available_titles),
             "owned_not_now": owned_not_now,
@@ -155,7 +155,7 @@ def render_priority_summary(titles, detail):
     st.markdown("## 📚 오늘 여기서 뭘 빌릴 수 있지?")
 
     name_to_summary = {x["name"]: x for x in summaries}
-    default_name = best["name"] if best else LIBRARIES[0]["name"]
+    default_name = best["name"] if best else LIBRARIES[0]["label"]
     selected_name = st.selectbox(
         "도서관 선택",
         [x["name"] for x in summaries],
