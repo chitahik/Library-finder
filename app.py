@@ -34,16 +34,18 @@ LIBRARIES = [
     {
         "key": "cheongun",
         "label": "청운문학도서관",
-        "type": "data4library",
+        "type": "jongno",
         "aliases": ["청운문학도서관", "종로구립청운문학도서관"],
-        "official": "https://lib.jongno.go.kr/menu/subpage/subpage_02/sub01.php",
+        "official": "https://lib.jongno.go.kr/plus_m/search_list_klas.php",
+        "match_names": ["청운문학도서관"],
     },
     {
         "key": "bookcafe",
         "label": "청운효자동 북카페",
-        "type": "data4library",
+        "type": "jongno",
         "aliases": ["청운효자동 북카페", "청운효자동북카페"],
-        "official": "https://lib.jongno.go.kr/menu/subpage/subpage_02/sub01.php",
+        "official": "https://lib.jongno.go.kr/plus_m/search_list_klas.php",
+        "match_names": ["청운 효자동 북카페", "청운효자동 북카페"],
     },
 ]
 
@@ -366,6 +368,122 @@ def data4library_result(lib, title):
     }
 
 
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_jongno(title):
+    """
+    종로구립도서관 통합검색 페이지.
+    검색 결과 페이지 URL이 query 파라미터를 사용하며,
+    결과 본문에 '도서관 : ... 대출가능/대출불가'가 노출된다.
+    """
+    url = "https://lib.jongno.go.kr/plus_m/search_list_klas.php"
+    r = requests.get(
+        url,
+        params={"query": title},
+        headers=HEADERS,
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.text, r.url
+
+
+def _split_jongno_records(text):
+    """
+    종로 검색결과는 각 레코드에
+    제목 / 저자 / 출판사 / 발행연도 / 청구기호 / 도서관 / 대출상태
+    순으로 노출된다. '도서관 :' 기준으로 앞뒤를 잘라 개별 레코드 후보를 만든다.
+    """
+    # 공백 정리
+    t = re.sub(r"\s+", " ", text)
+    # 각 '도서관 :' 앞쪽 최대 500자 + 뒤 상태 일부를 레코드로 추출
+    records = []
+    for m in re.finditer(r"도서관\s*:\s*", t):
+        start = max(0, m.start() - 500)
+        end = min(len(t), m.end() + 160)
+        records.append(t[start:end])
+    return records
+
+
+def jongno_result(lib, title):
+    last_err = None
+    for q in query_variants(title):
+        try:
+            html, url = fetch_jongno(q)
+        except Exception as e:
+            last_err = e
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True)
+        records = _split_jongno_records(text)
+
+        matched = []
+        target_norm = norm(title)
+        target_short = target_norm[:max(5, int(len(target_norm) * 0.7))]
+
+        for rec in records:
+            rec_norm = norm(rec)
+            # 도서관명 일치
+            if not any(norm(name) in rec_norm for name in lib["match_names"]):
+                continue
+
+            # 검색 제목 일치: 완전 포함 또는 앞 70% 이상 포함
+            if target_norm not in rec_norm and target_short not in rec_norm:
+                continue
+
+            # 제목이 너무 짧을 때 엉뚱한 레코드 방지
+            # 레코드 앞부분(도서관 표기 전)에 검색어가 실제로 있어야 함
+            libpos = rec.find("도서관")
+            before_lib = rec[:libpos] if libpos >= 0 else rec
+            if target_short not in norm(before_lib):
+                continue
+
+            matched.append(rec)
+
+        if not matched:
+            continue
+
+        copies = len(matched)
+        available = sum(1 for r in matched if "대출가능" in r and "대출불가" not in r)
+        unavailable = sum(1 for r in matched if "대출불가" in r)
+
+        if available > 0:
+            status = f"🟢 소장 {copies} / 즉시대출 가능"
+            if unavailable:
+                status += " · 대출불가 자료 있음"
+            avail_flag = 1
+        else:
+            status = f"🟡 소장 {copies} / 즉시대출 없음"
+            if unavailable:
+                status += " · 대출불가 자료 있음"
+            avail_flag = 0
+
+        return {
+            "status": status,
+            "available": avail_flag,
+            "copies": copies,
+            "url": url,
+            "source": "종로구립도서관 공식검색",
+        }
+
+    if last_err:
+        return {
+            "status": "⚠️ 공식 조회 오류",
+            "available": 0,
+            "copies": 0,
+            "url": lib["official"],
+            "source": "종로구립도서관 공식검색",
+        }
+
+    return {
+        "status": "⚪ 소장 없음",
+        "available": 0,
+        "copies": 0,
+        "url": lib["official"],
+        "source": "종로구립도서관 공식검색",
+    }
+
+
 def official_url(lib, title):
     if lib["type"] == "sen":
         return (
@@ -373,18 +491,22 @@ def official_url(lib, title):
             f'&menu_idx={lib["menu_idx"]}&search_type=titlecollquery'
             f'&search_text={quote_plus(title)}'
         )
+    if lib["type"] == "jongno":
+        return f'{lib["official"]}?query={quote_plus(title)}'
     return lib["official"]
 
 
 def check_library(lib, title):
     if lib["type"] == "sen":
         return sen_result(lib, title)
+    if lib["type"] == "jongno":
+        return jongno_result(lib, title)
     return data4library_result(lib, title)
 
 
 def main():
     st.title("📚 우리 동네 도서관 책 찾기")
-    st.caption("정독·교육청 어린이도서관은 공식 검색 결과를 직접 확인하고, 종로구 두 곳은 정보나루를 보조 조회합니다.")
+    st.caption("책 제목 한 번으로 네 도서관의 소장·대출 상태를 함께 확인합니다.")
 
     with st.expander("검색 대상 도서관"):
         st.write("정독도서관 · 서울특별시교육청 어린이도서관 · 청운문학도서관 · 청운효자동 북카페")
@@ -440,7 +562,7 @@ def main():
                 url = detail[title][lib["key"]]["url"]
                 st.markdown(f'[{lib["label"]} 공식 확인]({url})')
 
-    st.caption("※ 청운문학도서관·청운효자동 북카페는 정보나루 보조 조회 결과이며, 필요하면 공식 링크에서 최종 확인하세요.")
+    st.caption("※ 네 곳 모두 각 도서관 공식 검색 결과를 기준으로 조회합니다. 출발 직전에는 공식 링크에서 한 번 더 확인하면 가장 안전합니다.")
 
 
 if __name__ == "__main__":
