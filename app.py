@@ -2,6 +2,8 @@
 import os
 import re
 import time
+import json
+from pathlib import Path
 import unicodedata
 from difflib import SequenceMatcher
 from urllib.parse import quote_plus
@@ -188,6 +190,173 @@ def render_priority_summary(titles, detail):
 
     st.markdown("---")
     st.markdown("## 🔎 책별 상세 결과")
+
+
+# -----------------------------
+# V3.5 검색 안정성: 체크포인트 / 부분 결과 보존
+# -----------------------------
+CHECKPOINT_DIR = Path("/tmp/library_finder_checkpoints")
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+def _checkpoint_key(titles):
+    # 같은 책 목록이면 같은 임시 체크포인트 사용
+    raw = "\n".join(titles).encode("utf-8")
+    import hashlib
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+def _checkpoint_path(titles):
+    return CHECKPOINT_DIR / f"{_checkpoint_key(titles)}.json"
+
+def _json_safe_result(result):
+    if not isinstance(result, dict):
+        return {}
+    safe = {}
+    for k, v in result.items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            safe[k] = v
+        else:
+            safe[k] = str(v)
+    return safe
+
+def save_checkpoint(titles, detail, completed_pairs):
+    payload = {
+        "titles": titles,
+        "detail": {
+            title: {
+                libkey: _json_safe_result(result)
+                for libkey, result in libs.items()
+            }
+            for title, libs in detail.items()
+        },
+        "completed_pairs": [list(x) for x in completed_pairs],
+        "saved_at": time.time(),
+    }
+    try:
+        _checkpoint_path(titles).write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+def load_checkpoint(titles, max_age_seconds=60 * 60 * 6):
+    p = _checkpoint_path(titles)
+    if not p.exists():
+        return {}, set()
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        if payload.get("titles") != titles:
+            return {}, set()
+        if time.time() - float(payload.get("saved_at", 0)) > max_age_seconds:
+            return {}, set()
+
+        detail = payload.get("detail", {})
+        completed = {
+            (x[0], x[1])
+            for x in payload.get("completed_pairs", [])
+            if isinstance(x, list) and len(x) == 2
+        }
+        return detail, completed
+    except Exception:
+        return {}, set()
+
+def clear_checkpoint(titles):
+    try:
+        _checkpoint_path(titles).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+def make_failure_result(lib, exc=None):
+    return {
+        "status": "⚠️ 조회 실패 · 다시 시도 가능",
+        "available": 0,
+        "copies": None,
+        "url": official_url(lib, ""),
+        "source": f"일시적 조회 실패: {type(exc).__name__ if exc else 'Error'}",
+    }
+
+def search_one_library(lib, title):
+    # 도서관 하나의 실패가 전체 검색을 중단시키지 않음
+    try:
+        if lib.get("engine") == "sen":
+            return sen_result(lib, title)
+        if lib.get("engine") == "jongno":
+            return jongno_result(lib, title)
+        # 기존 구조 호환: key 기준 fallback
+        if lib["key"] in ("jeongdok", "child"):
+            return sen_result(lib, title)
+        return jongno_result(lib, title)
+    except Exception as e:
+        return {
+            "status": "⚠️ 조회 실패 · 다시 시도 가능",
+            "available": 0,
+            "copies": None,
+            "url": official_url(lib, title),
+            "source": f"일시적 조회 실패: {type(e).__name__}",
+        }
+
+def run_resilient_search(titles, previous_detail=None, previous_completed=None, only_failed=False):
+    detail = previous_detail or {}
+    completed = set(previous_completed or set())
+
+    # 총 작업량 = 제목 × 도서관. 이미 완료된 건 건너뜀.
+    total_pairs = len(titles) * len(LIBRARIES)
+    done_pairs = 0
+    for title in titles:
+        for lib in LIBRARIES:
+            if (title, lib["key"]) in completed:
+                done_pairs += 1
+
+    progress = st.progress(done_pairs / total_pairs if total_pairs else 0)
+    status_box = st.empty()
+
+    for ti, title in enumerate(titles, start=1):
+        detail.setdefault(title, {})
+        for li, lib in enumerate(LIBRARIES, start=1):
+            pair = (title, lib["key"])
+
+            if pair in completed:
+                continue
+
+            # 실패 항목만 재검색 모드
+            if only_failed:
+                old = detail.get(title, {}).get(lib["key"], {})
+                old_status = old.get("status", "")
+                if "조회 실패" not in old_status and "조회 오류" not in old_status and "자동조회 실패" not in old_status:
+                    completed.add(pair)
+                    continue
+
+            status_box.info(
+                f"검색 중 {ti}/{len(titles)}권 · {lib['label']} "
+                f"({done_pairs + 1}/{total_pairs})"
+            )
+
+            result = search_one_library(lib, title)
+            detail[title][lib["key"]] = result
+            completed.add(pair)
+            done_pairs += 1
+
+            # 도서관 하나 끝날 때마다 즉시 체크포인트 저장
+            save_checkpoint(titles, detail, completed)
+            progress.progress(min(done_pairs / total_pairs, 1.0))
+
+            # 공식 사이트에 연속 요청이 몰리지 않게 짧은 간격
+            time.sleep(0.2)
+
+    status_box.empty()
+    progress.progress(1.0)
+    save_checkpoint(titles, detail, completed)
+    return detail, completed
+
+def has_failed_items(titles, detail):
+    failed = []
+    for title in titles:
+        for lib in LIBRARIES:
+            result = detail.get(title, {}).get(lib["key"], {})
+            status = result.get("status", "")
+            if "조회 실패" in status or "조회 오류" in status or "자동조회 실패" in status:
+                failed.append((title, lib["key"]))
+    return failed
 
 st.set_page_config(page_title="우리 동네 도서관 책 찾기", page_icon="📚", layout="wide")
 
@@ -807,22 +976,34 @@ def main():
 
     rows = []
     detail = {}
-    progress = st.progress(0)
+    # V3.5: 이전 검색이 중간에 끊겼다면 /tmp 체크포인트에서 이어받음
+    restored_detail, restored_completed = load_checkpoint(titles)
+    if restored_completed:
+        st.info(f"이전 검색에서 완료된 {len(restored_completed)}개 조회를 불러왔어요. 이어서 검색합니다.")
 
-    for i, title in enumerate(titles):
-        row = {"책": title}
-        detail[title] = {}
-        for lib in LIBRARIES:
-            result = check_library(lib, title)
-            row[lib["label"]] = result["status"]
-            detail[title][lib["key"]] = result
-        rows.append(row)
-        progress.progress((i + 1) / len(titles))
+    detail, completed_pairs = run_resilient_search(
+        titles,
+        previous_detail=restored_detail,
+        previous_completed=restored_completed,
+    )
 
-        # 공식 사이트에 짧은 시간 동안 요청이 몰려 조회 오류가 나는 것을 줄인다.
-        if i < len(titles) - 1:
-            time.sleep(0.35)
-    progress.empty()
+    failed_pairs = has_failed_items(titles, detail)
+    if failed_pairs:
+        st.warning(f"⚠️ 일시적으로 실패한 조회가 {len(failed_pairs)}개 있어요. 나머지 결과는 그대로 보존했습니다.")
+        if st.button("🔁 실패한 항목만 다시 검색", use_container_width=True):
+            # 실패한 pair만 completed에서 제거한 뒤 재검색
+            retry_completed = set(completed_pairs)
+            for pair in failed_pairs:
+                retry_completed.discard(pair)
+
+            with st.spinner("실패한 항목만 다시 확인하는 중..."):
+                detail, completed_pairs = run_resilient_search(
+                    titles,
+                    previous_detail=detail,
+                    previous_completed=retry_completed,
+                    only_failed=True,
+                )
+            st.rerun()
 
     render_priority_summary(titles, detail)
 
