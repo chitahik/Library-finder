@@ -151,27 +151,33 @@ def sen_result(lib, title):
         if total == 0:
             continue
 
-        available = len(re.findall(r"자료상태\s*:\s*대출가능", text))
-        loaned = len(re.findall(r"자료상태\s*:\s*대출중", text))
-        reserved = len(re.findall(r"자료상태\s*:\s*예약가능(?:\([^)]*\))?", text))
-        other_status = len(re.findall(r"자료상태\s*:\s*(?!대출가능|대출중|예약가능)[^\n]+", text))
+        # 서울시교육청 검색 페이지는 동일한 결과를 모바일/데스크톱용 HTML로
+        # 중복 렌더링하는 경우가 있어 "자료상태" 문자열 개수로 복본 수를 세면
+        # 실제보다 2~4배 부풀려질 수 있다.
+        # 따라서 실제 소장 건수는 화면에 표시되는 "총 N건"을 기준으로 사용한다.
+        copies = total if total is not None else 1
 
-        # 결과는 있는데 상태 패턴이 안 잡히는 경우도 소장으로 처리하되 즉시대출은 단정하지 않음
-        copies = available + loaned + reserved + other_status
-        if copies == 0:
-            copies = total if total and total <= 50 else 1
+        # 대출 상태는 중복 HTML에 안전하도록 '존재 여부'만 판정한다.
+        has_available = re.search(r"자료상태\s*:\s*대출가능", text) is not None
+        has_loaned = re.search(r"자료상태\s*:\s*대출중", text) is not None
+        has_reserved = re.search(r"자료상태\s*:\s*예약가능(?:\([^)]*\))?", text) is not None
 
-        if available > 0:
-            label = f"🟢 소장 {copies} / 즉시대출 {available}"
-        elif reserved > 0 or loaned > 0:
+        if has_available:
+            label = f"🟢 소장 {copies} / 즉시대출 가능"
+            available = 1
+        elif has_reserved or has_loaned:
             extra = []
-            if reserved:
-                extra.append(f"예약가능 {reserved}")
-            if loaned:
-                extra.append(f"대출중 {loaned}")
-            label = f"🟡 소장 {copies} / 즉시대출 0" + (" · " + " · ".join(extra) if extra else "")
+            if has_reserved:
+                extra.append("예약가능 자료 있음")
+            if has_loaned:
+                extra.append("대출중 자료 있음")
+            label = f"🟡 소장 {copies} / 즉시대출 없음"
+            if extra:
+                label += " · " + " · ".join(extra)
+            available = 0
         else:
             label = f"📚 소장 {copies} / 대출상태 확인"
+            available = 0
 
         return {
             "status": label,
@@ -441,7 +447,7 @@ def main():
         "정독·어린이도서관은 해당 도서관 공식 검색 페이지를 직접 읽습니다. "
         "청운문학·청운효자동은 현재 정보나루를 보조로 사용하므로, 꼭 필요한 책은 공식 링크에서 마지막 확인을 권장합니다."
     )
-    st.caption("V2 테스트 기준: 《우리 가족의 보물을 찾아라!》는 교육청 어린이도서관 소장으로 잡혀야 합니다.")
+    st.caption("V2.1 테스트 기준: 《우리 가족의 보물을 찾아라!》는 정독 1건, 교육청 어린이도서관 3건으로 잡혀야 합니다.")
 
 
 if __name__ == "__main__":
