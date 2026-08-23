@@ -1,6 +1,7 @@
 
 import os
 import re
+import time
 import unicodedata
 from difflib import SequenceMatcher
 from urllib.parse import quote_plus
@@ -117,16 +118,33 @@ def fetch_sen(base, menu_idx, loc, title):
         "search_text": title,
         "search_type": "titlecollquery",
     }
-    r = requests.get(base, params=params, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    return r.text, r.url
+
+    last_err = None
+    # 10권 이상 연속 조회 시 교육청 서버가 순간적으로 429/5xx/연결 오류를
+    # 반환하는 경우를 대비해 짧은 backoff로 최대 3회 재시도한다.
+    for attempt in range(3):
+        try:
+            r = requests.get(base, params=params, headers=HEADERS, timeout=20)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"temporary HTTP {r.status_code}", response=r)
+            r.raise_for_status()
+            return r.text, r.url
+        except (requests.RequestException, requests.Timeout) as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+
+    raise last_err or RuntimeError("서울시교육청 공식 조회 실패")
 
 
 def sen_result(lib, title):
     last_err = None
+    had_successful_response = False
+
     for q in query_variants(title):
         try:
             html, url = fetch_sen(lib["base"], lib["menu_idx"], lib["loc"], q)
+            had_successful_response = True
         except Exception as e:
             last_err = e
             continue
@@ -190,14 +208,27 @@ def sen_result(lib, title):
             "source": "공식 도서관",
         }
 
-    if last_err:
+    # 중요한 구분:
+    # 어떤 검색 변형에서 한 번이라도 정상 응답을 받았다면,
+    # 다른 변형 하나가 실패했더라도 최종 결과를 "조회 오류"로 만들지 않는다.
+    if had_successful_response:
         return {
-            "status": "⚠️ 공식 조회 오류",
+            "status": "⚪ 소장 없음",
             "available": 0,
             "copies": 0,
             "url": official_url(lib, title),
             "source": "공식 도서관",
         }
+
+    if last_err:
+        return {
+            "status": "⚠️ 공식 조회 오류 · 잠시 후 재검색",
+            "available": 0,
+            "copies": None,
+            "url": official_url(lib, title),
+            "source": "공식 도서관",
+        }
+
     return {
         "status": "⚪ 소장 없음",
         "available": 0,
@@ -568,24 +599,30 @@ def _jongno_library_status(body, title, library_key):
 
 
 def jongno_result(lib, title):
-    try:
-        body, result_url = _jongno_browser_search(title)
-        status, available, copies = _jongno_library_status(body, title, lib["key"])
-        return {
-            "status": status,
-            "available": available,
-            "copies": copies,
-            "url": result_url,
-            "source": "종로구립도서관 공식검색(브라우저 자동화)",
-        }
-    except Exception as e:
-        return {
-            "status": "🔵 자동조회 실패 · 공식 검색에서 확인",
-            "available": 0,
-            "copies": None,
-            "url": official_url(lib, title),
-            "source": f"종로구립도서관 공식검색(브라우저 자동화): {type(e).__name__}",
-        }
+    last_err = None
+    for attempt in range(2):
+        try:
+            body, result_url = _jongno_browser_search(title)
+            status, available, copies = _jongno_library_status(body, title, lib["key"])
+            return {
+                "status": status,
+                "available": available,
+                "copies": copies,
+                "url": result_url,
+                "source": "종로구립도서관 공식검색(브라우저 자동화)",
+            }
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(1.0)
+
+    return {
+        "status": "⚠️ 자동조회 실패 · 잠시 후 재검색",
+        "available": 0,
+        "copies": None,
+        "url": official_url(lib, title),
+        "source": f"종로구립도서관 공식검색(브라우저 자동화): {type(last_err).__name__ if last_err else 'Error'}",
+    }
 
 
 def official_url(lib, title):
@@ -630,7 +667,9 @@ def main():
     if not titles:
         st.warning("책 제목을 한 권 이상 입력해주세요.")
         return
-    titles = titles[:30]
+    if len(titles) > 15:
+        st.info("한 번에 최대 15권까지 검색합니다. 안정적인 사용은 10권 안팎을 권장해요.")
+    titles = titles[:15]
 
     rows = []
     detail = {}
@@ -645,9 +684,28 @@ def main():
             detail[title][lib["key"]] = result
         rows.append(row)
         progress.progress((i + 1) / len(titles))
+
+        # 공식 사이트에 짧은 시간 동안 요청이 몰려 조회 오류가 나는 것을 줄인다.
+        if i < len(titles) - 1:
+            time.sleep(0.35)
     progress.empty()
 
     st.subheader("검색 결과")
+
+    failed_checks = 0
+    for title in titles:
+        for lib in LIBRARIES:
+            status = detail[title][lib["key"]]["status"]
+            if "조회 오류" in status or "자동조회 실패" in status:
+                failed_checks += 1
+
+    if failed_checks:
+        st.warning(
+            f"총 {len(titles)}권 검색은 완료했지만 {failed_checks}개 도서관 조회가 일시적으로 실패했어요. "
+            "해당 항목만 잠시 후 다시 검색하면 됩니다."
+        )
+    else:
+        st.success(f"{len(titles)}권 × 4개 도서관 조회 완료")
 
     # 모바일 우선: 가로 표 대신 책별로 도서관 4곳을 세로 표시한다.
     for title in titles:
@@ -666,7 +724,7 @@ def main():
                 url = detail[title][lib["key"]]["url"]
                 st.markdown(f'[{lib["label"]} 공식 확인]({url})')
 
-    st.caption("※ 책 제목 한 번으로 네 도서관을 함께 조회합니다. 청운 두 곳은 실제 브라우저를 자동으로 조작해 종로구 공식 검색 결과를 읽습니다.")
+    st.caption("※ 10권 안팎의 일괄검색을 안정적으로 처리하도록 재시도와 요청 간격을 적용했습니다. '소장 없음'과 '조회 오류'는 서로 다르게 표시합니다.")
 
 
 if __name__ == "__main__":
