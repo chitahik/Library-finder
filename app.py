@@ -3,7 +3,7 @@ import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 
 import pandas as pd
 import requests
@@ -369,17 +369,206 @@ def data4library_result(lib, title):
 
 
 
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _jongno_submit_search(title):
+    """
+    종로구립도서관 검색 폼의 input 이름/checkbox value를 하드코딩하지 않고
+    페이지 자체에서 찾아 제출한다. 사이트가 GET/POST 어느 방식이든 form method를 따른다.
+    """
+    session = requests.Session()
+    search_url = "https://lib.jongno.go.kr/plus_m/search_list_klas.php"
+    r = session.get(search_url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    forms = soup.find_all("form")
+    chosen = None
+    for form in forms:
+        txt = form.get_text(" ", strip=True)
+        action = form.get("action", "")
+        if "검색" in txt or "search" in action.lower() or "search_list_klas" in action:
+            # 텍스트 입력창이 있는 폼 우선
+            if form.find("input", {"type": ["text", "search"]}) or form.find("input", attrs={"name": re.compile("query|keyword|search", re.I)}):
+                chosen = form
+                break
+
+    if chosen is None:
+        raise RuntimeError("종로구 검색 폼을 찾지 못했습니다.")
+
+    data = {}
+
+    # hidden/default 값 보존
+    for inp in chosen.find_all("input"):
+        name = inp.get("name")
+        if not name:
+            continue
+        typ = (inp.get("type") or "text").lower()
+        if typ in {"hidden"}:
+            data[name] = inp.get("value", "")
+
+    # 검색어 입력 필드 자동 탐지
+    search_input = None
+    candidates = chosen.find_all("input")
+    for inp in candidates:
+        name = inp.get("name", "")
+        typ = (inp.get("type") or "text").lower()
+        if typ in {"text", "search"} and re.search(r"query|keyword|search|word|text|key", name, re.I):
+            search_input = inp
+            break
+    if search_input is None:
+        for inp in candidates:
+            typ = (inp.get("type") or "text").lower()
+            if typ in {"text", "search"}:
+                search_input = inp
+                break
+    if search_input is None or not search_input.get("name"):
+        raise RuntimeError("종로구 검색어 입력 필드를 찾지 못했습니다.")
+    data[search_input["name"]] = title
+
+    # 두 도서관 checkbox/select 값을 페이지에서 이름으로 찾아낸다.
+    target_names = ["청운문학도서관", "청운효자동 북카페", "청운 효자동 북카페"]
+    selected = 0
+
+    for inp in chosen.find_all("input", {"type": "checkbox"}):
+        name = inp.get("name")
+        if not name:
+            continue
+        # checkbox 주변 텍스트 확인
+        label_text = ""
+        iid = inp.get("id")
+        if iid:
+            lab = chosen.find("label", attrs={"for": iid})
+            if lab:
+                label_text += " " + lab.get_text(" ", strip=True)
+        parent = inp.parent
+        if parent:
+            label_text += " " + parent.get_text(" ", strip=True)
+
+        if any(t in label_text for t in target_names):
+            val = inp.get("value", "on")
+            # 같은 name의 복수 checkbox 처리
+            if name in data:
+                if not isinstance(data[name], list):
+                    data[name] = [data[name]]
+                data[name].append(val)
+            else:
+                data[name] = [val]
+            selected += 1
+
+    # select 기반 도서관 필터가 있으면 해당 option도 선택
+    for sel in chosen.find_all("select"):
+        name = sel.get("name")
+        if not name:
+            continue
+        vals = []
+        for opt in sel.find_all("option"):
+            txt = opt.get_text(" ", strip=True)
+            if any(t in txt for t in target_names):
+                vals.append(opt.get("value", txt))
+        if vals:
+            data[name] = vals if len(vals) > 1 else vals[0]
+            selected += len(vals)
+
+    action = urljoin(r.url, chosen.get("action") or r.url)
+    method = (chosen.get("method") or "get").lower()
+
+    if method == "post":
+        rr = session.post(action, data=data, headers=HEADERS, timeout=20)
+    else:
+        rr = session.get(action, params=data, headers=HEADERS, timeout=20)
+    rr.raise_for_status()
+    return rr.text, rr.url, selected
+
+
+def _jongno_cards(html):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 레코드 후보: '도서관 :' 또는 [도서관명]을 포함하는 블록
+    candidates = []
+    for tag in soup.find_all(["li", "div", "article", "tr"]):
+        txt = tag.get_text(" ", strip=True)
+        if not txt:
+            continue
+        if ("도서관" in txt and ("대출가능" in txt or "대출불가" in txt or "비치중" in txt)) or \
+           ("청운문학도서관" in txt and "저자" in txt) or ("청운효자동" in txt and "저자" in txt):
+            if 20 <= len(txt) <= 1800:
+                candidates.append(txt)
+
+    # 중첩 div 중복 제거: 가장 짧은 고유 텍스트를 선호
+    uniq = []
+    for txt in sorted(set(candidates), key=len):
+        if not any(txt in u or u in txt for u in uniq):
+            uniq.append(txt)
+    return uniq
+
+
 def jongno_result(lib, title):
-    """
-    종로구 공식 통합검색은 브라우저 폼 상태/선택 도서관 값을 이용해 검색하며,
-    단순 query GET 호출만으로는 동일 결과가 재현되지 않는 경우가 있다.
-    잘못된 '소장 없음' 판정을 하지 않기 위해 자동 판정 대신 공식확인 상태를 반환한다.
-    """
+    try:
+        html, result_url, selected = _jongno_submit_search(title)
+    except Exception:
+        return {
+            "status": "🔵 공식 검색에서 확인",
+            "available": 0,
+            "copies": None,
+            "url": official_url(lib, title),
+            "source": "종로구립도서관 공식검색",
+        }
+
+    cards = _jongno_cards(html)
+    target = norm(title)
+    short = target[:max(4, int(len(target) * 0.65))]
+
+    if lib["key"] == "cheongun":
+        lib_tokens = ["청운문학도서관"]
+    else:
+        lib_tokens = ["청운효자동북카페", "청운효자동 북카페", "청운 효자동 북카페"]
+
+    matches = []
+    for c in cards:
+        nc = norm(c)
+        if not any(norm(x) in nc for x in lib_tokens):
+            continue
+        if target not in nc and short not in nc:
+            continue
+        matches.append(c)
+
+    # 같은 책 카드가 상위 div/하위 div로 중복 검출될 수 있어 핵심 문자열 기준 dedupe
+    dedup = []
+    seen = set()
+    for c in matches:
+        # 저자~청구기호 정도를 fingerprint로
+        fp = norm(c)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        dedup.append(c)
+    matches = dedup
+
+    if not matches:
+        return {
+            "status": "⚪ 소장 없음",
+            "available": 0,
+            "copies": 0,
+            "url": result_url,
+            "source": "종로구립도서관 공식검색",
+        }
+
+    has_available = any(("대출가능" in c or "비치중" in c) and "대출불가" not in c for c in matches)
+    copies = len(matches)
+
+    if has_available:
+        status = f"🟢 소장 {copies} / 즉시대출 가능"
+        avail = 1
+    else:
+        status = f"🟡 소장 {copies} / 즉시대출 없음"
+        avail = 0
+
     return {
-        "status": "🔵 공식 검색에서 확인",
-        "available": 0,
-        "copies": None,
-        "url": official_url(lib, title),
+        "status": status,
+        "available": avail,
+        "copies": copies,
+        "url": result_url,
         "source": "종로구립도서관 공식검색",
     }
 
@@ -462,7 +651,7 @@ def main():
                 url = detail[title][lib["key"]]["url"]
                 st.markdown(f'[{lib["label"]} 공식 확인]({url})')
 
-    st.caption("※ 정독·교육청 어린이도서관은 자동 조회합니다. 청운문학·청운효자동은 종로구 공식 검색 폼의 세션/선택값 때문에 현재 자동 판정을 보류하고 공식 검색으로 연결합니다.")
+    st.caption("※ 네 곳 모두 각 도서관 공식 검색 결과를 기준으로 자동 조회합니다.")
 
 
 if __name__ == "__main__":
