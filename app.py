@@ -152,40 +152,39 @@ def render_priority_summary(titles, detail):
         )
 
     st.markdown("---")
-    st.markdown("## 📚 오늘 여기서 뭘 빌릴 수 있지?")
+    st.markdown("## 📚 도서관별 오늘 빌릴 수 있는 책")
 
-    name_to_summary = {x["name"]: x for x in summaries}
-    default_name = best["name"] if best else LIBRARIES[0]["label"]
-    selected_name = st.selectbox(
-        "도서관 선택",
-        [x["name"] for x in summaries],
-        index=[x["name"] for x in summaries].index(default_name) if summaries else 0,
-        key="summary_library_select",
-    )
-    selected = name_to_summary[selected_name]
+    # 1순위뿐 아니라 네 도서관 모두 한 화면에서 확인.
+    for rank, selected in enumerate(summaries, start=1):
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, "4위")
+        title_line = (
+            f"{medal} {selected['name']} — "
+            f"오늘 바로 {len(selected['available_titles'])}/{total}권"
+        )
 
-    if selected["available_titles"]:
-        st.markdown(f"### 🟢 오늘 바로 빌릴 수 있는 책 {len(selected['available_titles'])}권")
-        for t in selected["available_titles"]:
-            st.markdown(f"- {t}")
-    else:
-        st.info("오늘 바로 빌릴 수 있다고 확인된 책이 없어요.")
+        # 1순위는 기본으로 펼치고 나머지는 접어서 화면을 깔끔하게 유지.
+        with st.expander(title_line, expanded=(rank == 1)):
+            if selected["available_titles"]:
+                st.markdown(f"**🟢 오늘 바로 빌릴 수 있는 책 {len(selected['available_titles'])}권**")
+                for t in selected["available_titles"]:
+                    st.markdown(f"- {t}")
+            else:
+                st.info("오늘 바로 빌릴 수 있다고 확인된 책이 없어요.")
 
-    if selected["owned_not_now"]:
-        with st.expander(f"🟠 소장은 있지만 지금 바로 못 빌리는 책 {len(selected['owned_not_now'])}권"):
-            for t in selected["owned_not_now"]:
-                st.markdown(f"- {t}")
+            if selected["owned_not_now"]:
+                st.markdown(f"**🟠 소장은 있지만 지금 바로 못 빌리는 책 {len(selected['owned_not_now'])}권**")
+                for t in selected["owned_not_now"]:
+                    st.markdown(f"- {t}")
 
-    if selected["not_owned"]:
-        with st.expander(f"⚪ 소장 없음 {len(selected['not_owned'])}권"):
-            for t in selected["not_owned"]:
-                st.markdown(f"- {t}")
+            if selected["not_owned"]:
+                st.caption(f"⚪ 소장 없음 {len(selected['not_owned'])}권")
 
-    if selected["failed"]:
-        with st.expander(f"⚠️ 조회 실패 {len(selected['failed'])}권"):
-            for t in selected["failed"]:
-                st.markdown(f"- {t}")
-        st.caption("조회 실패 항목은 '소장 없음'으로 계산하지 않았어요.")
+            if selected["failed"]:
+                st.warning(f"⚠️ 조회 실패 {len(selected['failed'])}권")
+                for t in selected["failed"]:
+                    st.markdown(f"- {t}")
+
+    st.caption("※ 순위는 복본 수가 아니라, 입력한 책 제목 중 '오늘 즉시대출 가능한 제목 수'를 기준으로 계산합니다.")
 
     st.markdown("---")
     st.markdown("## 🔎 책별 상세 결과")
@@ -826,6 +825,12 @@ def main():
     progress.empty()
 
     render_priority_summary(titles, detail)
+
+    if len(titles) >= 8:
+        st.caption(
+            "⏱️ 10권 안팎 검색은 두 종류의 공식 조회 방식(API/웹 요청 + 브라우저 자동화)을 함께 써서 "
+            "시간이 걸릴 수 있어요. 중간에 공식 사이트 응답이 늦으면 자동 재시도합니다."
+        )
 
     st.subheader("검색 결과")
 
