@@ -55,6 +55,141 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; LibraryFinder/2.0; +https://streamlit.io)"
 }
 
+
+# -----------------------------
+# 오늘 어디로 갈지 / 도서관별 빌릴 책 요약
+# -----------------------------
+def _is_available_now(result):
+    status = (result or {}).get("status", "")
+    # 즉시대출 없음, 조회 오류는 제외
+    if "조회 오류" in status or "자동조회 실패" in status:
+        return False
+    if "즉시대출 없음" in status:
+        return False
+    return "즉시대출 가능" in status
+
+def _is_owned(result):
+    status = (result or {}).get("status", "")
+    if "조회 오류" in status or "자동조회 실패" in status:
+        return None
+    if "소장 없음" in status:
+        return False
+    return ("소장" in status) or ("대출중" in status) or ("예약가능" in status)
+
+def build_library_summary(titles, detail):
+    """
+    복본 권수 합계가 아니라 '입력한 서로 다른 제목 중 몇 종을 오늘 빌릴 수 있는가'로 계산.
+    """
+    summaries = []
+    for lib in LIBRARIES:
+        key = lib["key"]
+        available_titles = []
+        owned_not_now = []
+        not_owned = []
+        failed = []
+
+        for title in titles:
+            result = detail[title][key]
+            if _is_available_now(result):
+                available_titles.append(title)
+                continue
+
+            owned = _is_owned(result)
+            status = result.get("status", "")
+            if owned is None:
+                failed.append(title)
+            elif owned:
+                owned_not_now.append(title)
+            else:
+                not_owned.append(title)
+
+        summaries.append({
+            "key": key,
+            "name": lib["name"],
+            "available_titles": available_titles,
+            "available_count": len(available_titles),
+            "owned_not_now": owned_not_now,
+            "not_owned": not_owned,
+            "failed": failed,
+            "confirmed_owned_count": len(available_titles) + len(owned_not_now),
+        })
+
+    # 1순위: 오늘 바로 빌릴 수 있는 제목 수
+    # 2순위: 확인된 소장 제목 수
+    # 3순위: 조회 실패가 적은 곳
+    summaries.sort(
+        key=lambda x: (
+            -x["available_count"],
+            -x["confirmed_owned_count"],
+            len(x["failed"]),
+            x["name"],
+        )
+    )
+    return summaries
+
+def render_priority_summary(titles, detail):
+    summaries = build_library_summary(titles, detail)
+    total = len(titles)
+
+    st.markdown("## 📍 오늘 어디로 갈까?")
+    best = summaries[0] if summaries else None
+
+    if best:
+        st.success(
+            f"**1순위: {best['name']}** — 입력한 {total}권 중 "
+            f"**{best['available_count']}권을 오늘 바로 빌릴 수 있어요.**"
+        )
+
+    for rank, item in enumerate(summaries, start=1):
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}위")
+        extra = ""
+        if item["failed"]:
+            extra = f" · 확인 실패 {len(item['failed'])}권"
+        st.markdown(
+            f"**{medal} {item['name']}** — "
+            f"즉시대출 **{item['available_count']}/{total}권**"
+            f" · 소장 확인 {item['confirmed_owned_count']}권{extra}"
+        )
+
+    st.markdown("---")
+    st.markdown("## 📚 오늘 여기서 뭘 빌릴 수 있지?")
+
+    name_to_summary = {x["name"]: x for x in summaries}
+    default_name = best["name"] if best else LIBRARIES[0]["name"]
+    selected_name = st.selectbox(
+        "도서관 선택",
+        [x["name"] for x in summaries],
+        index=[x["name"] for x in summaries].index(default_name) if summaries else 0,
+        key="summary_library_select",
+    )
+    selected = name_to_summary[selected_name]
+
+    if selected["available_titles"]:
+        st.markdown(f"### 🟢 오늘 바로 빌릴 수 있는 책 {len(selected['available_titles'])}권")
+        for t in selected["available_titles"]:
+            st.markdown(f"- {t}")
+    else:
+        st.info("오늘 바로 빌릴 수 있다고 확인된 책이 없어요.")
+
+    if selected["owned_not_now"]:
+        with st.expander(f"🟠 소장은 있지만 지금 바로 못 빌리는 책 {len(selected['owned_not_now'])}권"):
+            for t in selected["owned_not_now"]:
+                st.markdown(f"- {t}")
+
+    if selected["not_owned"]:
+        with st.expander(f"⚪ 소장 없음 {len(selected['not_owned'])}권"):
+            for t in selected["not_owned"]:
+                st.markdown(f"- {t}")
+
+    if selected["failed"]:
+        with st.expander(f"⚠️ 조회 실패 {len(selected['failed'])}권"):
+            for t in selected["failed"]:
+                st.markdown(f"- {t}")
+        st.caption("조회 실패 항목은 '소장 없음'으로 계산하지 않았어요.")
+
+    st.markdown("---")
+    st.markdown("## 🔎 책별 상세 결과")
+
 st.set_page_config(page_title="우리 동네 도서관 책 찾기", page_icon="📚", layout="wide")
 
 st.markdown("""
@@ -647,7 +782,7 @@ def check_library(lib, title):
 
 def main():
     st.title("📚 우리 동네 도서관 책 찾기")
-    st.caption("책 제목 한 번으로 네 도서관의 소장·대출 상태를 함께 확인합니다.")
+    st.caption("책 목록을 넣으면 네 도서관을 한 번에 확인하고, 오늘 가장 많이 빌릴 수 있는 곳을 알려줍니다.")
 
     with st.expander("검색 대상 도서관"):
         st.write("정독도서관 · 서울특별시교육청 어린이도서관 · 청운문학도서관 · 청운효자동 북카페")
@@ -689,6 +824,8 @@ def main():
         if i < len(titles) - 1:
             time.sleep(0.35)
     progress.empty()
+
+    render_priority_summary(titles, detail)
 
     st.subheader("검색 결과")
 
