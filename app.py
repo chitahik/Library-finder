@@ -369,117 +369,17 @@ def data4library_result(lib, title):
 
 
 
-@st.cache_data(ttl=90, show_spinner=False)
-def fetch_jongno(title):
-    """
-    종로구립도서관 통합검색 페이지.
-    검색 결과 페이지 URL이 query 파라미터를 사용하며,
-    결과 본문에 '도서관 : ... 대출가능/대출불가'가 노출된다.
-    """
-    url = "https://lib.jongno.go.kr/plus_m/search_list_klas.php"
-    r = requests.get(
-        url,
-        params={"query": title},
-        headers=HEADERS,
-        timeout=15,
-    )
-    r.raise_for_status()
-    return r.text, r.url
-
-
-def _split_jongno_records(text):
-    """
-    종로 검색결과는 각 레코드에
-    제목 / 저자 / 출판사 / 발행연도 / 청구기호 / 도서관 / 대출상태
-    순으로 노출된다. '도서관 :' 기준으로 앞뒤를 잘라 개별 레코드 후보를 만든다.
-    """
-    # 공백 정리
-    t = re.sub(r"\s+", " ", text)
-    # 각 '도서관 :' 앞쪽 최대 500자 + 뒤 상태 일부를 레코드로 추출
-    records = []
-    for m in re.finditer(r"도서관\s*:\s*", t):
-        start = max(0, m.start() - 500)
-        end = min(len(t), m.end() + 160)
-        records.append(t[start:end])
-    return records
-
-
 def jongno_result(lib, title):
-    last_err = None
-    for q in query_variants(title):
-        try:
-            html, url = fetch_jongno(q)
-        except Exception as e:
-            last_err = e
-            continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(" ", strip=True)
-        records = _split_jongno_records(text)
-
-        matched = []
-        target_norm = norm(title)
-        target_short = target_norm[:max(5, int(len(target_norm) * 0.7))]
-
-        for rec in records:
-            rec_norm = norm(rec)
-            # 도서관명 일치
-            if not any(norm(name) in rec_norm for name in lib["match_names"]):
-                continue
-
-            # 검색 제목 일치: 완전 포함 또는 앞 70% 이상 포함
-            if target_norm not in rec_norm and target_short not in rec_norm:
-                continue
-
-            # 제목이 너무 짧을 때 엉뚱한 레코드 방지
-            # 레코드 앞부분(도서관 표기 전)에 검색어가 실제로 있어야 함
-            libpos = rec.find("도서관")
-            before_lib = rec[:libpos] if libpos >= 0 else rec
-            if target_short not in norm(before_lib):
-                continue
-
-            matched.append(rec)
-
-        if not matched:
-            continue
-
-        copies = len(matched)
-        available = sum(1 for r in matched if "대출가능" in r and "대출불가" not in r)
-        unavailable = sum(1 for r in matched if "대출불가" in r)
-
-        if available > 0:
-            status = f"🟢 소장 {copies} / 즉시대출 가능"
-            if unavailable:
-                status += " · 대출불가 자료 있음"
-            avail_flag = 1
-        else:
-            status = f"🟡 소장 {copies} / 즉시대출 없음"
-            if unavailable:
-                status += " · 대출불가 자료 있음"
-            avail_flag = 0
-
-        return {
-            "status": status,
-            "available": avail_flag,
-            "copies": copies,
-            "url": url,
-            "source": "종로구립도서관 공식검색",
-        }
-
-    if last_err:
-        return {
-            "status": "⚠️ 공식 조회 오류",
-            "available": 0,
-            "copies": 0,
-            "url": lib["official"],
-            "source": "종로구립도서관 공식검색",
-        }
-
+    """
+    종로구 공식 통합검색은 브라우저 폼 상태/선택 도서관 값을 이용해 검색하며,
+    단순 query GET 호출만으로는 동일 결과가 재현되지 않는 경우가 있다.
+    잘못된 '소장 없음' 판정을 하지 않기 위해 자동 판정 대신 공식확인 상태를 반환한다.
+    """
     return {
-        "status": "⚪ 소장 없음",
+        "status": "🔵 공식 검색에서 확인",
         "available": 0,
-        "copies": 0,
-        "url": lib["official"],
+        "copies": None,
+        "url": official_url(lib, title),
         "source": "종로구립도서관 공식검색",
     }
 
@@ -492,7 +392,7 @@ def official_url(lib, title):
             f'&search_text={quote_plus(title)}'
         )
     if lib["type"] == "jongno":
-        return f'{lib["official"]}?query={quote_plus(title)}'
+        return lib["official"]
     return lib["official"]
 
 
@@ -562,7 +462,7 @@ def main():
                 url = detail[title][lib["key"]]["url"]
                 st.markdown(f'[{lib["label"]} 공식 확인]({url})')
 
-    st.caption("※ 네 곳 모두 각 도서관 공식 검색 결과를 기준으로 조회합니다. 출발 직전에는 공식 링크에서 한 번 더 확인하면 가장 안전합니다.")
+    st.caption("※ 정독·교육청 어린이도서관은 자동 조회합니다. 청운문학·청운효자동은 종로구 공식 검색 폼의 세션/선택값 때문에 현재 자동 판정을 보류하고 공식 검색으로 연결합니다.")
 
 
 if __name__ == "__main__":
