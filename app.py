@@ -421,33 +421,26 @@ def main():
         progress.progress((i + 1) / len(titles))
     progress.empty()
 
-    df = pd.DataFrame(rows)
     st.subheader("검색 결과")
-    st.dataframe(df, hide_index=True, use_container_width=True)
 
-    # 즉시대출 가능 권수 기준 추천
-    counts = {}
-    for lib in LIBRARIES:
-        counts[lib["label"]] = sum(
-            1 for title in titles if detail[title][lib["key"]]["available"] > 0
-        )
-    best = max(counts, key=counts.get)
-    st.success(f"오늘 우선 가볼 곳: **{best}** — 입력한 책 중 **{counts[best]}권**이 대출 가능으로 확인됐어요.")
+    # 모바일 우선: 가로 표 대신 책별로 도서관 4곳을 세로 표시한다.
+    for title in titles:
+        st.markdown(f"### 📖 {title}")
+        for lib in LIBRARIES:
+            result = detail[title][lib["key"]]
+            st.markdown(f"**{lib['label']}**")
+            st.write(result["status"])
+        if title != titles[-1]:
+            st.divider()
 
     with st.expander("🔗 공식 검색으로 최종 확인"):
         for title in titles:
             st.markdown(f"**{title}**")
-            links = []
             for lib in LIBRARIES:
                 url = detail[title][lib["key"]]["url"]
-                links.append(f'[{lib["label"]}]({url})')
-            st.markdown(" · ".join(links))
+                st.markdown(f'[{lib["label"]} 공식 확인]({url})')
 
-    st.info(
-        "정독·어린이도서관은 해당 도서관 공식 검색 페이지를 직접 읽습니다. "
-        "청운문학·청운효자동은 현재 정보나루를 보조로 사용하므로, 꼭 필요한 책은 공식 링크에서 마지막 확인을 권장합니다."
-    )
-    st.caption("V2.1 테스트 기준: 《우리 가족의 보물을 찾아라!》는 정독 1건, 교육청 어린이도서관 3건으로 잡혀야 합니다.")
+    st.caption("※ 청운문학도서관·청운효자동 북카페는 정보나루 보조 조회 결과이며, 필요하면 공식 링크에서 최종 확인하세요.")
 
 
 if __name__ == "__main__":
